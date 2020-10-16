@@ -106,6 +106,71 @@ impl World {
         }
         entity
     }
+    /// Create an entity with certain components at a specific ID and generation.
+    ///
+    /// Returns the ID of the newly created entity.
+    ///
+    /// Arguments can be tuples, structs annotated with `#[derive(Bundle)]`, or the result of
+    /// calling `build` on an `EntityBuilder`, which is useful if the set of components isn't
+    /// statically known. To spawn an entity with only one component, use a one-element tuple like
+    /// `(x,)`.
+    ///
+    /// Any type that satisfies `Send + Sync + 'static` can be used as a component.
+    ///
+    /// Since this reuses an existing entity id, previously dead Entity handles can become alive again,
+    /// directly (via the existing id), or indirectly (after despawning the spawn_at'd handle, and
+    /// spawning more entities).
+    ///
+    /// # Example
+    /// ```
+    /// # use hecs::*;
+    /// let mut world = World::new();
+    /// let a = world.spawn((123, "abc"));
+    /// let b = world.spawn((456, true));
+    /// world.despawn(a);
+    /// assert!(!world.contains(a));
+    /// // all previous references to 'a' will be valid again, but pointing to the new entity 'c'.
+    /// let c = world.spawn_at(a, (789, "ABC"));
+    /// assert_eq!(a, c);
+    /// assert!(world.contains(a));
+    /// ```
+    pub fn spawn_at(&mut self, entity: Entity, components: impl DynamicBundle) -> Entity {
+        // Ensure all entity allocations are accounted for so `self.entities` can realloc if
+        // necessary
+        self.flush();
+
+        let loc = self.entities.alloc_at(entity);
+        if let Some(loc) = loc {
+            if let Some(moved) =
+                unsafe { self.archetypes[loc.archetype as usize].remove(loc.index) }
+            {
+                self.entities.meta[moved as usize].location.index = loc.index;
+            }
+        }
+
+        let archetype_id = components.with_ids(|ids| {
+            self.index.get(ids).copied().unwrap_or_else(|| {
+                let x = self.archetypes.len() as u32;
+                self.archetypes.push(Archetype::new(components.type_info()));
+                self.index.insert(ids.to_vec(), x);
+                self.archetype_generation += 1;
+                x
+            })
+        });
+
+        let archetype = &mut self.archetypes[archetype_id as usize];
+        unsafe {
+            let index = archetype.allocate(entity.id);
+            components.put(|ptr, ty| {
+                archetype.put_dynamic(ptr, ty.id(), ty.layout().size(), index);
+            });
+            self.entities.meta[entity.id as usize].location = Location {
+                archetype: archetype_id,
+                index,
+            };
+        }
+        entity
+    }
 
     /// Efficiently spawn a large number of entities with the same components
     ///
@@ -818,6 +883,22 @@ mod tests {
         assert_ne!(a.generation, b.generation);
     }
 
+    #[test]
+    fn spawn_at() {
+        let mut world = World::new();
+        let a = world.spawn(());
+        world.despawn(a).unwrap();
+        let b = world.spawn(());
+        assert!(world.contains(b));
+        assert_eq!(a.id, b.id);
+        assert_ne!(a.generation, b.generation);
+        let c = world.spawn_at(a, ());
+        assert_eq!(a.id, c.id);
+        assert_eq!(a.generation, c.generation);
+        assert!(!world.contains(b));
+        assert_eq!(b.id, c.id);
+        assert_ne!(b.generation, c.generation);
+    }
     #[test]
     fn reuse_populated() {
         let mut world = World::new();
